@@ -104,7 +104,7 @@ class RegularExpressionTests(unittest.TestCase):
     def test_star_fail(self) -> None:
         def f(s: str) -> bool:
             '''
-            pre: s[1] == 'a'
+            pre: s[0] == 'a'
             post: _
             '''
             return not re.fullmatch('a*', s)

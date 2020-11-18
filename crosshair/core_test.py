@@ -6,8 +6,8 @@ import sys
 import unittest
 from typing import *
 
-from crosshair.core import make_fake_object
 from crosshair.core_and_libs import *
+from crosshair.core import make_fake_object
 from crosshair.test_util import check_ok
 from crosshair.test_util import check_exec_err
 from crosshair.test_util import check_post_err
@@ -154,7 +154,8 @@ class ReferenceHoldingClass:
 
 def fibb(x: int) -> int:
     '''
-    pre: x>=0
+    pre: 0 <= x
+    pre: x <= 10  # just to cap runtime
     post: _ < 10
     '''
     if x <= 2:
@@ -166,7 +167,7 @@ def fibb(x: int) -> int:
 
 def recursive_example(x: int) -> bool:
     '''
-    pre: x >= 0
+    pre: 0 <= x < 100
     post[]:
         __old__.x >= 0  # just to confirm __old__ works in recursive cases
         _ == True
@@ -462,7 +463,10 @@ class ObjectsTest(unittest.TestCase):
 
     def test_enforced_fn_preconditions(self) -> None:
         def f(x: int) -> bool:
-            ''' post: _ == True '''
+            '''
+            pre: x < 10  # bound runtime
+            post: _ == True
+            '''
             return bool(fibb(x)) or True
         self.assertEqual(*check_exec_err(f))
 

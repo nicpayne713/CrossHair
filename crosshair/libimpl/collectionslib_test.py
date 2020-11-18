@@ -137,9 +137,11 @@ class CollectionsLibDefaultDictTests(unittest.TestCase):
             return (symbolic, concrete)
         self.assertEqual(*check_unknown(f))
 
+    # TODO: symbolic engine does not create DefaultDicts without factories.
     def test_basic_fail(self) -> None:
         def f(a: DefaultDict[int, int], k: int, v: int) -> None:
             '''
+            pre: a.default_factory
             post[a]: a[42] != 42
             '''
             a[k] = v
@@ -148,6 +150,7 @@ class CollectionsLibDefaultDictTests(unittest.TestCase):
     def test_default_fail(self) -> None:
         def f(a: DefaultDict[int, int], k: int) -> None:
             '''
+            pre: a.default_factory
             post: a[k] <= 100
             '''
             if a[k] > 100:

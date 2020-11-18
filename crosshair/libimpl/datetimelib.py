@@ -22,12 +22,6 @@ def _timedelta_skip_construct(days, seconds, microseconds):
     return delta
 
 def make_registrations():
-
-    # WARNING: This is destructive for the datetime module.
-    # It disables the C implementation for the entire interpreter.
-    sys.modules['_datetime'] = None  # type: ignore
-    importlib.reload(datetime)
-
     # Default pickling will realize the symbolic args; avoid this:
     datetime.date.__deepcopy__ = lambda s, _memo: datetime.date(s.year, s.month, s.day)
     datetime.time.__deepcopy__ = lambda s, _memo: datetime.time(

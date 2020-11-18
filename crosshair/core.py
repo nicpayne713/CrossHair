@@ -17,6 +17,7 @@ from typing import *
 import ast
 import builtins
 import collections
+import contextlib
 import copy
 import enum
 import inspect
@@ -32,72 +33,23 @@ import types
 import typing
 
 import forbiddenfruit  # type: ignore
+import hypothesis
+import hypothesis.strategies
 import typing_inspect  # type: ignore
 import z3  # type: ignore
 
 from crosshair import dynamic_typing
 from crosshair.condition_parser import get_fn_conditions, get_class_conditions, ConditionExpr, Conditions, fn_globals
 from crosshair.enforce import EnforcedConditions, PostconditionFailed
+from crosshair.registrations import builtin_patches, CrossHairValue, proxy_factory_for_type, Patched
 from crosshair.statespace import TrackingStateSpace, StateSpace, HeapRef, SnapshotRef, SearchTreeNode, model_value_to_python, VerificationStatus, IgnoreAttempt, SinglePathNode, CallAnalysis, MessageType, AnalysisMessage
 from crosshair.util import CrosshairInternal, UnexploredPath, IdentityWrapper, AttributeHolder, CrosshairUnsupported
-from crosshair.util import debug, frame_summary_for_fn, samefile, set_debug, extract_module_from_file, name_of_type, walk_qualname
+from crosshair.util import compose_context_managers, debug, frame_summary_for_fn, origin_of, samefile
+from crosshair.util import set_debug, extract_module_from_file, name_of_type, walk_qualname
 from crosshair.type_repo import get_subclass_map
 
 
 _MISSING = object()
-
-def is_pure(obj: object) -> bool:
-    if isinstance(obj, type):
-        return True if '__dict__' in dir(obj) else hasattr(obj, '__slots__')
-    elif callable(obj):
-        return inspect.isfunction(obj)  # isfunction selects "user-defined" functions only
-    else:
-        return True
-
-# TODO Unify common logic here with EnforcedConditions?
-class Patched:
-    def __init__(self, enabled: Callable[[], bool]):
-        self._patches = _PATCH_REGISTRATIONS
-        self._enabled = enabled
-        self._originals: Dict[IdentityWrapper, Dict[str, object]] = collections.defaultdict(dict)
-
-    def set(self, target: object, key: str, value: object):
-        if is_pure(target):
-            target.__dict__[key] = value
-        else:
-            forbiddenfruit.curse(target, key, value)
-
-    def patch(self, target: object, key: str, patched_fn: Callable):
-        enabled = self._enabled
-        orig_fn = getattr(target, key, None)
-        if orig_fn is None:
-            self.set(target, key, patched_fn)
-        else:
-            def call_if_enabled(*a, **kw):
-                if enabled():
-                    return patched_fn(*a, **kw)
-                else:
-                    return orig_fn(*a, **kw)
-            functools.update_wrapper(call_if_enabled, orig_fn)
-            self.set(target, key, call_if_enabled)
-
-    def __enter__(self) -> None:
-        for target_wrapper, members in self._patches.items():
-            container_originals = self._originals[target_wrapper]
-            container = target_wrapper.get()
-            for key, val in members.items():
-                container_originals[key] = getattr(container, key, _MISSING)
-                self.patch(container, key, val)
-
-    def __exit__(self, exc_type, exc_value, tb) -> None:
-        for target_wrapper, members in self._patches.items():
-            container = target_wrapper.get()
-            originals = self._originals[target_wrapper]
-            for key, orig_val in originals.items():
-                if orig_val is _MISSING:
-                    delattr(container, key)
-                else:
-                    self.set(container, key, orig_val)
 
 
 class ExceptionFilter:
@@ -144,7 +96,7 @@ class ExceptionFilter:
                 raise CrosshairUnsupported('Detected proxy intolerance: ' + exc_str)
         if isinstance(exc_value, (UnexploredPath, CrosshairInternal, z3.Z3Exception)):
             return False  # internal issue: re-raise
-        if isinstance(exc_value, BaseException):  # TODO: should this be "Exception" instead?
+        if isinstance(exc_value, Exception):
             # Most other issues are assumed to be user-level exceptions:
             self.user_exc = (
                 exc_value, traceback.extract_tb(sys.exc_info()[2]))
@@ -152,10 +104,6 @@ class ExceptionFilter:
             return True  # suppress user-level exception
         return False  # re-raise resource and system issues
 
-
-class CrossHairValue:
-    def __ch_realize__(self):
-        raise NotImplementedError
 
 def normalize_pytype(typ: Type) -> Type:
     if typing_inspect.is_typevar(typ):
@@ -177,11 +125,6 @@ def normalize_pytype(typ: Type) -> Type:
         return type
     return typ
 
-def origin_of(typ: Type) -> Type:
-    if hasattr(typ, '__origin__'):
-        return typ.__origin__
-    return typ
-
 def type_arg_of(typ: Type, index: int) -> Type:
     args = type_args_of(typ)
     return args[index] if index < len(args) else object
@@ -197,20 +140,6 @@ def python_type(o: object) -> Type:
         return o.__ch_pytype__()  # type: ignore
     else:
         return type(o)
-
-def realize(value: object):
-    if isinstance(value, CrossHairValue):
-        return value.__ch_realize__()
-    else:
-        return value
-
-def with_realized_args(fn: Callable):
-    def realizer(*a, **kw):
-        a = map(realize, a)
-        kw = {k:realize(v) for (k, v) in kw.items()}
-        return fn(*a, **kw)
-    functools.update_wrapper(realizer, fn)
-    return realizer
 
 _IMMUTABLE_TYPES = (int, float, complex, bool, tuple, frozenset, type(None))
 def forget_contents(value: object, space: StateSpace):
@@ -389,27 +318,6 @@ def proxy_for_class(typ: Type, space: StateSpace, varname: str, meet_class_invar
                                         inv_condition.expr_source)
     return obj
 
-_PATCH_REGISTRATIONS: Dict[IdentityWrapper, Dict[str, Callable]] = collections.defaultdict(dict)
-def register_patch(entity: object, patch_value: Callable, attr_name: Optional[str] = None):
-    if attr_name in _PATCH_REGISTRATIONS[IdentityWrapper(entity)]:
-        raise CrosshairInternal(f'Doubly registered patch: {object} . {attr_name}')
-    if attr_name is None:
-        attr_name = getattr(patch_value, '__name__', None)
-        assert attr_name is not None
-    _PATCH_REGISTRATIONS[IdentityWrapper(entity)][attr_name] = patch_value
-
-def builtin_patches():
-    return _PATCH_REGISTRATIONS[IdentityWrapper(builtins)]
-
-_SIMPLE_PROXIES: MutableMapping[object, Callable] = {}
-
-def register_type(typ: Type,
-                  creator: Union[Type, Callable]) -> None:
-    assert typ is origin_of(typ), \
-            f'Only origin types may be registered, not "{typ}": try "{origin_of(typ)}" instead.'
-    if typ in _SIMPLE_PROXIES:
-        raise CrosshairInternal(f'Duplicate type "{typ}" registered')
-    _SIMPLE_PROXIES[typ] = creator
 
 def proxy_for_type(typ: Type, space: StateSpace, varname: str,
                    meet_class_invariants=True,
@@ -424,7 +332,7 @@ def proxy_for_type(typ: Type, space: StateSpace, varname: str,
             if space.smt_fork():
                 return enum_value
         return enum_values[-1]
-    proxy_factory = _SIMPLE_PROXIES.get(origin)
+    proxy_factory = proxy_factory_for_type(origin)
     if proxy_factory:
         def recursive_proxy_factory(t: Type):
             return proxy_for_type(t, space, varname + space.uniq(),
@@ -505,6 +413,7 @@ class AnalysisOptions:
     per_condition_timeout: float = 1.5
     per_path_timeout: float = 0.75
     report_all: bool = False
+    concrete_percent: float = 0.25
 
     # Transient members (not user-configurable):
     deadline: float = float('NaN')
@@ -514,6 +423,14 @@ class AnalysisOptions:
         if self.stats is not None:
             self.stats[key] += 1
 
+    def validate(self) -> Optional[str]:
+        if self.per_condition_timeout <= 0.0:
+            return 'per_condition_timeout must be greater than zero.'
+        if self.per_path_timeout <= 0.0:
+            return 'per_path_timeout must be greater than zero.'
+        if not (0.0 <= self.concrete_percent <= 1.0):
+            return 'concrete_percent must be between 0 and 1.'
+        return None
 
 _DEFAULT_OPTIONS = AnalysisOptions()
 
@@ -618,6 +535,75 @@ def analyze_function(fn: Callable,
     return all_messages.get()
 
 
+# Set some global settings for hypothesis.
+# The verbosity, in particular, needs to happen at the global level to ensure
+# all messages are suppressed.
+hypothesis.settings.register_profile(
+    "crosshair_profile",
+    max_examples = sys.maxsize, # we run based on timeout, not example count
+    phases = (hypothesis.Phase.generate, hypothesis.Phase.target, hypothesis.Phase.shrink),
+    verbosity = hypothesis.Verbosity.quiet,
+    #verbosity = hypothesis.Verbosity.debug,
+)
+hypothesis.settings.load_profile("crosshair_profile")
+
+class AttemptsTimedOut(BaseException):
+    pass
+class AttemptRefuted(BaseException):
+    def __init__(self, analysis: CallAnalysis):
+        self.analysis = analysis
+
+def analyze_with_hypothesis(fn: Callable, conditions: Conditions, options: AnalysisOptions) -> Sequence[AnalysisMessage]:
+    h_duration = options.per_condition_timeout * options.concrete_percent
+    h_deadline = time.time() + h_duration
+
+    sig = conditions.sig
+    arg_strategies = {}
+    empty = inspect.Parameter.empty
+    strat = hypothesis.strategies
+    for name, param in sig.parameters.items():
+        if param.annotation != empty:
+            arg_strategies[name] = strat.from_type(param.annotation)
+        elif param.default != empty:
+            arg_strategies[name] = strat.one_of(strat.just(param.default), strat.from_type(object))
+        else:
+            arg_strategies[name] = strat.from_type(object)
+
+    def checked_fn(**kw):
+        secs_left = h_deadline - time.time()
+        if secs_left <= 0:
+            raise AttemptsTimedOut
+        bound_args = sig.bind(**kw)
+        orig_args = copy.deepcopy(bound_args)
+        context_maker = contextlib.nullcontext
+        call_analysis = attempt_call(
+            conditions, fn, bound_args, orig_args, context_maker, lambda:None)
+        if call_analysis.verification_status == VerificationStatus.REFUTED:
+            raise AttemptRefuted(call_analysis)
+    wrapped = hypothesis.given(**arg_strategies)(checked_fn) if arg_strategies else checked_fn
+    wrapped = hypothesis.settings(
+        deadline = int(1000 * options.per_path_timeout), # deadline per test
+    )(wrapped)
+    try:
+        from crosshair.timeouts import SignalTimeout
+        with SignalTimeout(h_duration + 5.0), EnforcedConditions(fn_globals(fn)):
+            wrapped()  # type: ignore
+    except AttemptRefuted as exc_value:
+        return exc_value.analysis.messages
+    except hypothesis.errors.ResolutionFailed as e:
+        # hypothesis does not have a strategy for some type
+        debug('Skipping hypothesis; no strategy: ', e)
+    except hypothesis.errors.Flaky:
+        # We don't trust hypothesis that it's really flaky because it raises this for
+        # stack overflows on deterministic code.
+        debug('Skipping hypothesis; claiming nondeterministic.')
+    except AttemptsTimedOut as exc_value:
+        pass
+    except Exception as exc:
+        debug('Aborted hypothesis with unhandled exception: ', type(exc).__name__, exc)
+    return []
+
+
 def analyze_single_condition(fn: Callable,
                              options: AnalysisOptions,
                              conditions: Conditions) -> Sequence[AnalysisMessage]:
@@ -625,6 +611,15 @@ def analyze_single_condition(fn: Callable,
     debug('assuming preconditions: ', ','.join(
         [p.expr_source for p in conditions.pre]))
     options.deadline = time.time() + options.per_condition_timeout
+
+    if options.concrete_percent > 0:
+        hypothesis_messages = analyze_with_hypothesis(fn, conditions, options)
+        debug('hypothesis results: ', hypothesis_messages)
+        if hypothesis_messages:
+            return hypothesis_messages
+
+    if options.concrete_percent >= 1.0:
+        return []
 
     analysis = analyze_calltree(fn, options, conditions)
 
@@ -760,9 +755,17 @@ def analyze_calltree(fn: Callable,
                                        search_root=search_root)
             cur_space[0] = space
             try:
+                bound_args = gen_args(conditions.sig, space)
+                with space.framework():
+                    # TODO: looks wrong(-ish) to guard this with space.framework().
+                    # Copy on custom objects may require patched builtins. (datetime.timedelta is one such case)
+                    orig_args = copy.deepcopy(bound_args)
+                space.checkpoint()
+                context_maker = lambda: compose_context_managers(
+                    enforced_conditions.enabled_enforcement(), short_circuit)
                 # The real work happens here!:
                 call_analysis = attempt_call(
-                    conditions, space, fn, short_circuit, enforced_conditions)
+                    conditions, fn, bound_args, orig_args, context_maker, space.check_deferred_assumptions)
                 if failing_precondition is not None:
                     cur_precondition = call_analysis.failing_precondition
                     if cur_precondition is None:
@@ -791,10 +794,8 @@ def analyze_calltree(fn: Callable,
                 break
     top_analysis = search_root.child.get_result()
     if top_analysis.messages:
-        #log = space.execution_log()
         all_messages.extend(
             replace(m,
-                    #execution_log=log,
                     test_fn=fn.__qualname__,
                     condition_src=conditions.post[0].expr_source)
             for m in top_analysis.messages)
@@ -889,6 +890,7 @@ def deep_eq(old_val: object, new_val: object, visiting: Set[Tuple[int, int]]) ->
         elif isinstance(old_val, Iterable):
             assert isinstance(new_val, Iterable)
             if isinstance(old_val, Sized):
+                assert isinstance(new_val, Sized)
                 if len(old_val) != len(new_val):
                     return False
             return all(deep_eq(o, n, visiting) for (o, n) in
@@ -925,8 +927,7 @@ class MessageGenerator:
             return AnalysisMessage(message_type, detail, suggested_filename, suggested_lineno, 0, tb)
         else:
             try:
-                exprline = linecache.getlines(suggested_filename)[
-                    suggested_lineno - 1].strip()
+                exprline = linecache.getlines(suggested_filename or '')[suggested_lineno - 1].strip()
             except IndexError:
                 exprline = '<unknown>'
             detail = f'"{exprline}" yields {detail}'
@@ -934,18 +935,13 @@ class MessageGenerator:
 
 
 def attempt_call(conditions: Conditions,
-                 space: StateSpace,
                  fn: Callable,
-                 short_circuit: ShortCircuitingContext,
-                 enforced_conditions: EnforcedConditions) -> CallAnalysis:
-    bound_args = gen_args(conditions.sig, space)
+                 bound_args: inspect.BoundArguments,
+                 orig_args: inspect.BoundArguments,
+                 context_maker: Callable[[], ContextManager],
+                 assumption_checker: Callable[[],None]) -> CallAnalysis:
 
     msg_gen = MessageGenerator(fn)
-    with space.framework():
-        # TODO: looks wrong(-ish) to guard this with space.framework().
-        # Copy on custom objects may require patched builtins. (datetime.timedelta is one such case)
-        original_args = copy.deepcopy(bound_args)
-    space.checkpoint()
 
     lcls: Mapping[str, object] = bound_args.arguments
     # In preconditions, __old__ exists but is just bound to the same args.
@@ -955,7 +951,7 @@ def attempt_call(conditions: Conditions,
     expected_exceptions = conditions.raises
     for precondition in conditions.pre:
         with ExceptionFilter(expected_exceptions) as efilter:
-            with enforced_conditions.enabled_enforcement(), short_circuit:
+            with context_maker():
                 precondition_ok = precondition.evaluate(lcls)
             if not precondition_ok:
                 debug('Failed to meet precondition', precondition.expr_source)
@@ -974,25 +970,24 @@ def attempt_call(conditions: Conditions,
                                 f'it raised "{repr(user_exc)} at {tb.format()[-1]}"')
 
     with ExceptionFilter(expected_exceptions) as efilter:
-        with enforced_conditions.enabled_enforcement(), short_circuit:
-            assert not space.running_framework_code
+        with context_maker():
             __return__ = fn(*bound_args.args, **bound_args.kwargs)
         lcls = {**bound_args.arguments,
                 '__return__': __return__,
                 '_': __return__,
-                '__old__': AttributeHolder(original_args.arguments),
+                '__old__': AttributeHolder(orig_args.arguments),
                 fn.__name__: fn}
 
     if efilter.ignore:
         debug('Ignored exception in function.', efilter.analysis)
         return efilter.analysis
     elif efilter.user_exc is not None:
-        space.check_deferred_assumptions()
+        assumption_checker()
         (e, tb) = efilter.user_exc
         detail = name_of_type(type(e)) + ': ' + str(e)
         frame_filename, frame_lineno = frame_summary_for_fn(tb, fn)
         debug('exception while evaluating function body:', detail, frame_filename, 'line', frame_lineno)
-        detail += ' ' + get_input_description(fn.__name__, original_args, _MISSING)
+        detail += ' ' + get_input_description(fn.__name__, orig_args, _MISSING)
         return CallAnalysis(VerificationStatus.REFUTED,
                             [msg_gen.make(MessageType.EXEC_ERR, detail,
                                           frame_filename, frame_lineno, ''.join(tb.format()))])
@@ -1000,9 +995,9 @@ def attempt_call(conditions: Conditions,
     for argname, argval in bound_args.arguments.items():
         if (conditions.mutable_args is not None and
             argname not in conditions.mutable_args):
-            old_val, new_val = original_args.arguments[argname], argval
+            old_val, new_val = orig_args.arguments[argname], argval
             if not deep_eq(old_val, new_val, set()):
-                space.check_deferred_assumptions()
+                assumption_checker()
                 detail = 'Argument "{}" is not marked as mutable, but changed from {} to {}'.format(
                     argname, old_val, new_val)
                 debug('Mutablity problem:', detail)
@@ -1021,10 +1016,10 @@ def attempt_call(conditions: Conditions,
         debug('Ignored exception in postcondition.', efilter.analysis)
         return efilter.analysis
     elif efilter.user_exc is not None:
-        space.check_deferred_assumptions()
+        assumption_checker()
         (e, tb) = efilter.user_exc
         detail = repr(e) + ' ' + get_input_description(fn.__name__,
-                                                       original_args, __return__, post_condition.addl_context)
+                                                       orig_args, __return__, post_condition.addl_context)
         debug('exception while calling postcondition:', detail)
         failures = [msg_gen.make(MessageType.POST_ERR,
                                  detail, post_condition.filename, post_condition.line,
@@ -1034,10 +1029,10 @@ def attempt_call(conditions: Conditions,
         debug('Postcondition confirmed.')
         return CallAnalysis(VerificationStatus.CONFIRMED)
     else:
-        space.check_deferred_assumptions()
+        assumption_checker()
         detail = 'false ' + \
                  get_input_description(
-                     fn.__name__, original_args, __return__, post_condition.addl_context)
+                     fn.__name__, orig_args, __return__, post_condition.addl_context)
         debug(detail)
         failures = [msg_gen.make(MessageType.POST_FAIL,
                                  detail, post_condition.filename, post_condition.line, '')]

@@ -31,6 +31,7 @@ def command_line_parser() -> argparse.ArgumentParser:
     common.add_argument('--verbose', '-v', action='store_true')
     common.add_argument('--per_path_timeout', type=float)
     common.add_argument('--per_condition_timeout', type=float)
+    common.add_argument('--concrete_percent', type=float)
     parser = argparse.ArgumentParser(description='CrossHair Analysis Tool')
     subparsers = parser.add_subparsers(help='sub-command help', dest='action')
     check_parser = subparsers.add_parser(
@@ -56,7 +57,7 @@ def mtime(path: str) -> Optional[float]:
 
 def process_level_options(command_line_args: argparse.Namespace) -> AnalysisOptions:
     options = AnalysisOptions()
-    for optname in ('per_path_timeout', 'per_condition_timeout', 'report_all'):
+    for optname in ('per_path_timeout', 'per_condition_timeout', 'report_all', 'concrete_percent'):
         arg_val = getattr(command_line_args, optname, False)
         if arg_val is not None:
             setattr(options, optname, arg_val)
@@ -470,9 +471,13 @@ def check(args: argparse.Namespace, options: AnalysisOptions, stdout: TextIO) ->
 
 
 def main() -> None:
-    args = command_line_parser().parse_args()
+    parser = command_line_parser()
+    args = parser.parse_args()
     set_debug(args.verbose)
     options = process_level_options(args)
+    error_string = options.validate()
+    if error_string is not None:
+        parser.error(error_string)
     if sys.path and sys.path[0] != '':
         # fall back to current directory to look up modules
         sys.path.append('')

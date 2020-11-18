@@ -11,19 +11,19 @@ from typing import *
 import builtins as orig_builtins
 
 from crosshair.abcstring import AbcString
-from crosshair.core import register_patch
-from crosshair.core import register_type
-from crosshair.core import realize
+from crosshair.registrations import register_patch
+from crosshair.registrations import register_type
+from crosshair.registrations import realize
+from crosshair.registrations import CrossHairValue
 from crosshair.core import proxy_for_type
 from crosshair.core import python_type
 from crosshair.core import normalize_pytype
 from crosshair.core import choose_type
-from crosshair.core import CrossHairValue
 from crosshair.core import SmtProxyMarker
 from crosshair.core import type_arg_of
 from crosshair.core import type_args_of
 from crosshair.core import name_of_type
-from crosshair.core import with_realized_args
+from crosshair.registrations import with_realized_args
 from crosshair.objectproxy import ObjectProxy
 from crosshair.simplestructs import SimpleDict
 from crosshair.simplestructs import SequenceConcatenation
@@ -1302,6 +1302,9 @@ class SmtCallable(SmtBackedValue):
 
     def __init___(self, statespace: StateSpace, typ: Type, smtvar: object):
         SmtBackedValue.__init__(self, statespace, typ, smtvar)
+
+    def __bool__(self):
+        return True
 
     def __eq__(self, other):
         return (self.var is other.var) if isinstance(other, SmtCallable) else False

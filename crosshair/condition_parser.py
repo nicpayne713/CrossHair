@@ -290,6 +290,7 @@ def get_fn_conditions(fn: Callable, self_type: Optional[type] = None) -> Optiona
     for line_num, expr in parse.sections['pre']:
         pre.append(ConditionExpr(filename, line_num, expr, fn_globals(fn)))
     for line_num, expr in parse.sections['raises']:
+        # TODO: comment with comma inside of it won't work!
         for exc_source in expr.split(','):
             try:
                 exc_type = eval(exc_source)

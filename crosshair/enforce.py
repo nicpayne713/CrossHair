@@ -12,11 +12,11 @@ from crosshair.condition_parser import Conditions, get_fn_conditions, ClassCondi
 from crosshair.util import IdentityWrapper, AttributeHolder
 
 
-class PreconditionFailed(BaseException):
+class PreconditionFailed(Exception):
     pass
 
 
-class PostconditionFailed(BaseException):
+class PostconditionFailed(Exception):
     pass
 
 
@@ -64,6 +64,7 @@ def EnforcementWrapper(fn: Callable, conditions: Conditions, enforced: 'Enforced
                         postcondition.filename, postcondition.line))
         #print('Completed enforcement wrapper ', fn)
         return ret
+    functools.update_wrapper(wrapper, fn)
     return wrapper
 
 

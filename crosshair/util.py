@@ -44,6 +44,13 @@ def frame_summary_for_fn(frames: traceback.StackSummary, fn: Callable) -> Tuple[
         debug(f'Unable to get source information for function {fn_name} in file "{fn_file}"')
         return (fn_file, 0)
 
+def compose_context_managers(x: ContextManager, y: ContextManager):
+    @contextlib.contextmanager
+    def context():
+        with x, y:
+            yield (x, y)
+    return context()
+
 def set_debug(debug: bool):
     global _DEBUG
     _DEBUG = debug
@@ -166,6 +173,12 @@ def memo(f):
             saved[a] = f(a)
         return saved[a]
     return memo_wrapper
+
+def origin_of(typ: Type) -> Type:
+    if hasattr(typ, '__origin__'):
+        return typ.__origin__
+    return typ
+
 
 
 _T = TypeVar('_T')

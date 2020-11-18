@@ -8,8 +8,9 @@ import time
 import unittest
 import traceback
 from typing import *
-from crosshair.core import proxy_for_type, type_args_of, realize, Patched, builtin_patches
 import crosshair.core_and_libs
+from crosshair.core import proxy_for_type, type_args_of, Patched, builtin_patches
+from crosshair.registrations import realize
 from crosshair.condition_parser import resolve_signature
 from crosshair.libimpl.builtinslib import coerce_to_smt_sort, origin_of
 from crosshair.statespace import SinglePathNode, TrackingStateSpace, CallAnalysis, VerificationStatus, IgnoreAttempt, CrosshairInternal
@@ -88,6 +89,7 @@ class FuzzTest(unittest.TestCase):
             ('+{}', object),
             ('-{}', object),
             ('~{}', object),
+            # TODO: conversions, especially bool()
             # dir(), pickling?
         ])
 
